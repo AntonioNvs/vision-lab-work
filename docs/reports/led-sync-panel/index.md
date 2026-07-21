@@ -81,7 +81,7 @@ The current-limiting resistor determines LED brightness, which directly affects 
 
 ### 4.1 Experiment
 
-Two videos of the panel running `./timecode` (default: 500 µs/step Gray code) were recorded with a Pixel 7 at 4K30, identical framing and lighting. The only variable was the resistor.
+Two videos of the panel running `./timecode` (default: 500 µs/step Gray code) were recorded with an iPhone 17 at 4K30, identical framing and lighting. The only variable was the resistor.
 
 ### 4.2 Results
 
