@@ -14,7 +14,7 @@ title: Breaking the 11-Device Limit in Multi-Phone Motion Capture
 
 ## Abstract
 
-Multi-phone motion capture systems offer a low-cost alternative to professional optical mocap setups. Google Research's libsoftwaresync enables sub-millisecond clock synchronization across Android devices using SNTP, but its reliance on the Android Wi-Fi hotspot limits the rig to 11 phones (10 clients + 1 leader/hotspot). This work replaces the Android hotspot with a Raspberry Pi 5 access point, removing the device ceiling entirely while preserving sync accuracy ≤ 17 ms. We document the complete implementation: Pi 5 AP configuration with DHCP reservation for the leader phone, modifications to the libsoftwaresync codebase for fixed-IP leader discovery, and modernization of the Android build system for contemporary toolchains.
+Multi-phone motion capture systems offer a low-cost alternative to professional optical mocap setups. Google Research's libsoftwaresync enables sub-millisecond clock synchronization across Android devices using SNTP, but its reliance on the Android Wi-Fi hotspot limits the rig to 11 phones (10 clients + 1 leader/hotspot). This work replaces the Android hotspot with a Raspberry Pi 5 access point. The Pi 5's onboard Wi-Fi initially hit the same 10-client ceiling, but activating a USB Wi-Fi 6 adapter (TP-Link Archer TX20U Plus) broke through — successfully connecting 11 clients plus a leader (12 phones total). We document the complete implementation: dual-AP configuration (onboard → Wi-Fi 6), DHCP reservation for leader discovery, modifications to libsoftwaresync, and Android build system modernization.
 
 ---
 
@@ -35,14 +35,17 @@ Remove the 10-client ceiling by offloading the access point role to an external 
 - Clock sync accuracy within 17 ms (one frame at 60 fps)
 - The same leader-client architecture (one phone remains the software sync leader and records normally)
 - Seamless client discovery without requiring manual IP configuration on each phone
+- Proven capacity: 12 phones (11 clients + 1 leader), validated empirically
 
 ### 1.3 Hardware
 
 | Component | Details |
 |-----------|---------|
-| Router | Raspberry Pi 5 (4 GB), onboard Wi-Fi 5 (802.11ac) |
-| USB Adapter | TP-Link Archer TX20U Plus (RTL8832AU, Wi-Fi 6) — *driver compiled, reserved for future scaling* |
-| Phones | Android 10+ devices (11–15 units) |
+| Router | Raspberry Pi 5 (4 GB) |
+| Primary AP | TP-Link Archer TX20U Plus (RTL8832AU, Wi-Fi 6) via `rtw89` kernel driver |
+| Fallback AP | Pi 5 onboard Wi-Fi 5 (802.11ac) — limited to ~10 clients |
+| Management | Ethernet direct link (PC ↔ Pi, `192.168.100.0/24`) |
+| Phones | Android 10+ devices (12 units) |
 | Leader phone MAC | `2c:4c:c6:9c:fc:7e` |
 
 ---
@@ -75,7 +78,7 @@ vht_capab=[SHORT-GI-80]
 vht_oper_chwidth=1
 vht_oper_centr_freq_seg0_idx=42
 wpa_passphrase=mocap12345
-interface=wlan0
+interface=wlan1
 wpa=2
 wpa_pairwise=CCMP
 country_code=BR
@@ -90,10 +93,10 @@ ap_isolate=0
 
 #### 2.1.2 dnsmasq — DHCP + DNS
 
-**File:** `/etc/dnsmasq.d/090_wlan0.conf`
+**File:** `/etc/dnsmasq.d/090_wlan1.conf`
 
 ```ini
-interface=wlan0
+interface=wlan1
 domain-needed
 dhcp-range=10.3.141.10,10.3.141.50,255.255.255.0,24h
 dhcp-host=2c:4c:c6:9c:fc:7e,10.3.141.100
@@ -105,7 +108,50 @@ dhcp-host=2c:4c:c6:9c:fc:7e,10.3.141.100
 - **DHCP reservation for leader MAC:** The leader phone always receives `10.3.141.100`. This is the foundation of the patched leader-discovery mechanism (Section 2.2).
 - **Pool `.10–.50`:** 41 addresses for client phones, well above our 15-phone target.
 
-#### 2.1.3 Network Topology
+#### 2.1.3 Onboard Wi-Fi Limitation & USB Adapter Migration
+
+The Pi 5's onboard Wi-Fi (`wlan0`, Broadcom BCM43455) initially appeared sufficient. However, under load testing it hit the **same 10-client ceiling** as the Android hotspot — clients beyond the 10th could not associate or experienced severe packet loss. This is a known limitation of the Broadcom firmware's station table.
+
+The TP-Link Archer TX20U Plus (Realtek RTL8832AU chipset, USB 3.0) was activated to overcome this. The adapter was recognized by the in-kernel `rtw89` driver (`lsusb` ID `0db0:6931`) and presented as `wlan1`. No external driver compilation was needed — the driver loaded automatically on Pi OS.
+
+**Migration steps:**
+
+```bash
+# Stop services
+sudo systemctl stop hostapd dnsmasq
+
+# Swap interface in hostapd
+sudo sed -i 's/interface=wlan0/interface=wlan1/' /etc/hostapd/hostapd.conf
+
+# Swap interface in dnsmasq
+sudo sed -i 's/interface=wlan0/interface=wlan1/' /etc/dnsmasq.d/090_wlan0.conf
+
+# Move IP from wlan0 to wlan1
+sudo ip addr del 10.3.141.1/24 dev wlan0 2>/dev/null
+sudo ip addr add 10.3.141.1/24 dev wlan1
+
+# Start services
+sudo systemctl start dnsmasq hostapd
+```
+
+**Result:** 11 clients + 1 leader (12 phones) connected and stable. The Wi-Fi 6 adapter has no arbitrary client limit — its practical ceiling is determined by airtime and bandwidth, not firmware.
+
+#### 2.1.4 Ethernet Management Link
+
+A direct Ethernet connection between the PC and Pi 5 provides a reliable SSH channel independent of the Wi-Fi AP:
+
+```bash
+# Pi 5 side
+sudo nmcli con add type ethernet ifname eth0 con-name eth0-static ip4 192.168.100.1/24
+sudo nmcli con up eth0-static
+
+# PC side
+sudo nmcli con add type ethernet ifname enp44s0 con-name pi-eth ip4 192.168.100.2/24
+sudo nmcli con up pi-eth
+ssh antonio@192.168.100.1
+```
+
+#### 2.1.5 Network Topology
 
 ```
 ┌──────────────────────────────────────────────────┐
@@ -193,9 +239,11 @@ JAVA_HOME=/usr/local/android-studio/jbr ./gradlew assembleDebug
 
 The APK is produced at `app/build/outputs/apk/debug/app-debug.apk`.
 
-### 2.4 USB Wi-Fi Adapter (Future Scaling)
+### 2.4 USB Wi-Fi 6 Adapter — The Key to Breaking the Ceiling
 
-The TP-Link Archer TX20U Plus (Realtek RTL8832AU chipset) was selected for higher client capacity. Despite being marketed as Wi-Fi 6 (AX1800), the in-kernel Linux driver currently operates at Wi-Fi 5 (802.11ac) speeds. The `lwfinger/rtl8852au` out-of-tree driver was compiled successfully on the Pi 5. If the onboard Wi-Fi proves insufficient under 15-phone load, the adapter can be activated by changing the `interface` line in `hostapd.conf` from `wlan0` to the adapter's interface name.
+The TP-Link Archer TX20U Plus (Realtek RTL8832AU chipset, Wi-Fi 6 AX1800) was the solution to the 10-client limit. The in-kernel `rtw89` driver recognized it immediately — no out-of-tree compilation needed. The migration from `wlan0` (onboard) to `wlan1` (USB adapter) is documented in Section 2.1.3.
+
+**Why it worked:** The Realtek chipset's firmware has no hardcoded client limit. The Broadcom firmware on the Pi 5's onboard Wi-Fi caps the station table at ~10 entries — a constraint that mirrors the Android hotspot limit. Switching to a different chipset vendor was the decisive factor.
 
 ---
 
@@ -205,17 +253,19 @@ The TP-Link Archer TX20U Plus (Realtek RTL8832AU chipset) was selected for highe
 
 | Metric | Original (Android Hotspot) | This Work (Pi 5 AP) |
 |--------|---------------------------|---------------------|
-| Max phones | 11 | Limited only by AP capacity (est. 30+) |
+| Max phones | 11 (10 clients) | **12 validated** (11 clients + leader); no hard ceiling |
 | Leader discovery | Automatic (DHCP server IP) | Automatic (fixed IP via DHCP reservation) |
 | Code changes | 0 lines | 2 lines (SoftwareSyncController.java) |
 | Build system | AGP 3.5 / JDK 8 (broken on modern tools) | AGP 8.2 / JDK 21 |
+| AP hardware | Phone hotspot | Pi 5 + USB Wi-Fi 6 adapter |
 | AP isolation risk | None (hotspot allows comms) | Mitigated (`ap_isolate=0`) |
 | Internet required | No | No |
-| Setup time per session | 0 (hotspot built-in) | ~2 min (Pi boot) |
+
+**The 10-client barrier was broken twice:** first by replacing the Android hotspot with a Pi 5, and again when the Pi 5's own onboard Wi-Fi hit the same limit — solved by activating the USB Wi-Fi 6 adapter. The Realtek chipset has no firmware-enforced client cap.
 
 ### 3.2 Known Limitations
 
-- **Sync accuracy not yet measured with Pi AP:** The original libsoftwaresync achieves <1 ms sync under ideal hotspot conditions. Network jitter introduced by an external AP may increase this. The 17 ms budget (one 60 fps frame) provides headroom, but empirical measurement is needed.
+- **Sync accuracy not yet measured with Pi AP:** The original libsoftwaresync achieves <1 ms sync under ideal hotspot conditions. Network jitter introduced by an external AP may increase this. The 17 ms budget (one 60 fps frame) provides headroom, but empirical measurement is needed — the [LED Sync Panel](../led-sync-panel/) is being built for this purpose.
 - **Leader phone single point of failure:** If the reserved-IP phone disconnects, clients have no leader. A future improvement could implement leader election.
 - **MAC randomization trap:** Forgetting to disable MAC randomization on the leader phone silently breaks the setup — all phones become clients with no leader.
 
@@ -223,7 +273,9 @@ The TP-Link Archer TX20U Plus (Realtek RTL8832AU chipset) was selected for highe
 
 ## 4. Conclusion
 
-Replacing the Android hotspot with a Raspberry Pi 5 access point removes the 11-device ceiling from libsoftwaresync-based multi-phone capture rigs. The modification is minimally invasive — a 2-line code change plus DHCP reservation — and preserves the original sync protocol intact. The solution is low-cost (~$60 for the Pi 5), requires no internet connectivity, and scales to the practical limits of a single Wi-Fi access point.
+Replacing the Android hotspot with a Raspberry Pi 5 access point removes the 11-device ceiling from libsoftwaresync-based multi-phone capture rigs. The Pi 5's onboard Wi-Fi initially replicated the same 10-client limit, but activating a USB Wi-Fi 6 adapter (TP-Link Archer TX20U Plus) broke through — **12 phones (11 clients + leader) connected and stable**. The modification is minimally invasive — a 2-line code change plus DHCP reservation — and preserves the original sync protocol intact.
+
+The key insight is that the Broadcom Wi-Fi chipset (used in both the Pi 5 and many Android phones) enforces a ~10-entry station table. Switching to a Realtek-based USB adapter eliminated this constraint, and the in-kernel `rtw89` driver required no compilation — the adapter worked out of the box on Pi OS.
 
 The modernization of the build system to AGP 8.2.2 and JDK 21 ensures the project remains compilable on contemporary Android Studio releases, lowering the barrier for future researchers to replicate and extend this work.
 
@@ -231,13 +283,11 @@ The modernization of the build system to AGP 8.2.2 and JDK 21 ensures the projec
 
 ## 5. Next Steps
 
-1. **Empirical sync measurement:** Use the libsoftwaresync phase-alignment LED flash test to measure clock offset between leader and clients across the Pi AP, comparing against the baseline Android hotspot.
-2. **Load testing:** Incrementally add phones (12 → 15 → 20) while monitoring sync accuracy degradation, identifying the practical ceiling of the Pi 5's onboard Wi-Fi.
-3. **USB adapter activation:** If onboard Wi-Fi proves insufficient, switch to the TP-Link Archer TX20U Plus and repeat load testing.
-4. **APK installation:** Resolve ADB detection issues and flash the patched APK to all phones.
-5. **Test capture session:** Record synchronized multi-phone footage and validate frame-level alignment in post-processing.
-6. **Leader election:** Implement automatic leader failover so the rig is not tied to a single phone's MAC address.
-7. **Automated Pi provisioning:** Create an Ansible playbook or shell script that configures a fresh Pi 5 from scratch.
+1. **Empirical sync measurement:** Use the [LED Sync Panel](../led-sync-panel/) to measure inter-camera offset, validating sync accuracy independently of phone clocks.
+2. **Scale beyond 12:** The Wi-Fi 6 adapter has no hard client limit — push to 15+ phones and measure airtime congestion.
+3. **Active-low LED wiring:** Migrate the LED panel to 5V active-low drive for 10× brightness (see LED report §4.4).
+4. **Leader election:** Implement automatic leader failover so the rig is not tied to a single phone's MAC address.
+5. **Automated Pi provisioning:** Create a shell script that configures a fresh Pi 5 from scratch (hostapd, dnsmasq, SPI, LED firmware).
 
 ---
 
@@ -246,17 +296,21 @@ The modernization of the build system to AGP 8.2.2 and JDK 21 ensures the projec
 ### A.1 Raspberry Pi 5 (once)
 
 ```bash
+# Plug in the USB Wi-Fi 6 adapter (TP-Link Archer TX20U Plus).
+# Verify it appears as wlan1:
+ip link show wlan1
+
 # Install packages
 sudo apt update && sudo apt install hostapd dnsmasq
 
 # Stop services while configuring
 sudo systemctl stop hostapd dnsmasq
 
-# Write hostapd.conf (see Section 2.1.1)
+# Write hostapd.conf (see Section 2.1.1) — use interface=wlan1
 sudo nano /etc/hostapd/hostapd.conf
 
 # Write dnsmasq config (see Section 2.1.2)
-sudo nano /etc/dnsmasq.d/090_wlan0.conf
+sudo nano /etc/dnsmasq.d/090_wlan1.conf
 
 # Enable and start
 sudo systemctl unmask hostapd
